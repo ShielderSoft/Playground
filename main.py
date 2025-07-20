@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -11,8 +11,18 @@ import time
 import os
 import psutil
 import logging
-from typing import Dict, Any
-from pydantic import BaseModel
+from typing import Dict, Any, Optional
+from pydantic import BaseModel, validator
+import asyncio
+from pathlib import Path
+
+from utils import (
+    clone_repository_to_filesystem,
+    analyze_repository,
+    stream_file_contents,
+    validate_repo_id,
+    validate_file_path
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -24,7 +34,7 @@ limiter = Limiter(key_func=get_remote_address)
 # Initialize FastAPI app
 app = FastAPI(
     title="Playground API",
-    description="Secure API for repo cloning, scanning and cleansing",
+    description="Production-grade API for GitHub repository operations",
     version="1.0.0",
     docs_url="/docs" if os.getenv("NODE_ENV") != "production" else None,
     redoc_url="/redoc" if os.getenv("NODE_ENV") != "production" else None
@@ -50,7 +60,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -60,8 +70,38 @@ app.add_middleware(
     allowed_hosts=["localhost", "127.0.0.1", "0.0.0.0"] + allowed_origins
 )
 
-# Security bearer token (optional)
-security = HTTPBearer(auto_error=False)
+# Pydantic models
+class CloneRequest(BaseModel):
+    repo_url: str
+    branch: Optional[str] = "main"
+    
+    @validator('repo_url')
+    def validate_repo_url(cls, v):
+        if not v:
+            raise ValueError('Repository URL cannot be empty')
+        
+        # Basic validation for GitHub URLs
+        if v.startswith('http'):
+            if 'github.com' not in v:
+                raise ValueError('Only GitHub repositories are supported')
+        elif '/' in v and len(v.split('/')) == 2:
+            # Format: org/repo
+            org, repo = v.split('/')
+            if not org or not repo:
+                raise ValueError('Invalid org/repo format')
+        else:
+            raise ValueError('Invalid repository URL format')
+        
+        return v
+
+class CloneResponse(BaseModel):
+    repo_id: str
+
+class AnalysisResponse(BaseModel):
+    total_lines: int
+    file_types: Dict[str, int]
+    languages: Dict[str, float]
+    structure: Dict[str, Any]
 
 class HealthResponse(BaseModel):
     status: str
@@ -71,27 +111,21 @@ class HealthResponse(BaseModel):
     memory_usage: Dict[str, Any]
     cpu_usage: float
 
-class APIResponse(BaseModel):
-    message: str
-    features: list
-    endpoints: Dict[str, str]
-
-class WelcomeResponse(BaseModel):
-    message: str
-    version: str
-    endpoints: Dict[str, str]
-
 # Store app start time for uptime calculation
 app.state.start_time = time.time()
 
+# Ensure codebase directory exists
+CODEBASE_DIR = Path("/app/codebase")
+CODEBASE_DIR.mkdir(exist_ok=True)
+
 @app.get("/health", response_model=HealthResponse)
-@limiter.limit("10/minute")
+@limiter.limit("30/minute")
 async def health_check(request: Request):
     """Health check endpoint with system metrics"""
     try:
         # Get system metrics
         memory_info = psutil.virtual_memory()
-        cpu_percent = psutil.cpu_percent(interval=1)
+        cpu_percent = psutil.cpu_percent(interval=0.1)
         
         uptime = time.time() - app.state.start_time
         
@@ -112,99 +146,129 @@ async def health_check(request: Request):
         logger.error(f"Health check failed: {str(e)}")
         raise HTTPException(status_code=500, detail="Health check failed")
 
-@app.get("/", response_model=WelcomeResponse)
-@limiter.limit("30/minute")
-async def root(request: Request):
-    """Welcome endpoint with API information"""
-    return WelcomeResponse(
-        message="Welcome to Playground - A secure containerized environment for repo operations",
-        version="1.0.0",
-        endpoints={
-            "health": "/health",
-            "api": "/api",
-            "docs": "/docs" if os.getenv("NODE_ENV") != "production" else "disabled"
-        }
-    )
-
-@app.get("/api", response_model=APIResponse)
-@limiter.limit("20/minute")
-async def api_info(request: Request):
-    """API information endpoint"""
-    return APIResponse(
-        message="Secure API for repository operations",
-        features=[
-            "Repository cloning with security validation",
-            "Comprehensive security scanning",
-            "Code cleansing and sanitization",
-            "Vulnerability assessment and reporting",
-            "Rate limiting and security headers",
-            "Health monitoring and metrics"
-        ],
-        endpoints={
-            "clone": "/api/clone",
-            "scan": "/api/scan",
-            "cleanse": "/api/cleanse",
-            "status": "/api/status"
-        }
-    )
-
-@app.post("/api/clone")
-@limiter.limit("5/minute")
-async def clone_repository(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-):
-    """Clone repository endpoint (placeholder)"""
-    # TODO: Implement secure repository cloning
-    return {
-        "message": "Repository cloning endpoint",
-        "status": "not_implemented",
-        "security_note": "This endpoint will validate repository URLs and implement secure cloning"
-    }
-
-@app.post("/api/scan")
+@app.post("/clone", response_model=CloneResponse)
 @limiter.limit("10/minute")
-async def scan_repository(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-):
-    """Scan repository for vulnerabilities endpoint (placeholder)"""
-    # TODO: Implement security scanning
-    return {
-        "message": "Repository scanning endpoint",
-        "status": "not_implemented",
-        "security_note": "This endpoint will perform comprehensive security scanning"
-    }
+async def clone_repo(request: Request, clone_request: CloneRequest):
+    """
+    Clone a GitHub repository to the local filesystem.
+    
+    Accepts repo_url (GitHub URL or org/repo format) and optional branch.
+    Returns a unique repo_id for accessing the cloned repository.
+    """
+    try:
+        github_token = os.getenv("GITHUB_TOKEN")
+        if not github_token:
+            logger.error("GitHub token not configured")
+            raise HTTPException(
+                status_code=500, 
+                detail="GitHub authentication not configured"
+            )
+        
+        # Clone repository using background task to avoid blocking
+        repo_id = await asyncio.get_event_loop().run_in_executor(
+            None,
+            clone_repository_to_filesystem,
+            clone_request.repo_url,
+            clone_request.branch,
+            github_token,
+            str(CODEBASE_DIR)
+        )
+        
+        logger.info(f"Successfully cloned repository to {repo_id}")
+        return CloneResponse(repo_id=repo_id)
+        
+    except ValueError as e:
+        logger.warning(f"Invalid clone request: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Clone operation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to clone repository")
 
-@app.post("/api/cleanse")
-@limiter.limit("5/minute")
-async def cleanse_repository(
+@app.get("/generate", response_model=AnalysisResponse)
+@limiter.limit("20/minute")
+async def generate_analysis(
     request: Request,
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+    repo_id: str = Query(..., description="Repository ID returned from clone endpoint")
 ):
-    """Cleanse repository endpoint (placeholder)"""
-    # TODO: Implement code cleansing
-    return {
-        "message": "Repository cleansing endpoint",
-        "status": "not_implemented",
-        "security_note": "This endpoint will sanitize and clean repository code"
-    }
+    """
+    Analyze a cloned repository and return comprehensive metadata.
+    
+    Returns line count, file types, detected languages, and full directory structure.
+    """
+    try:
+        # Validate repo_id format and existence
+        if not validate_repo_id(repo_id):
+            raise HTTPException(status_code=400, detail="Invalid repository ID format")
+        
+        repo_path = CODEBASE_DIR / repo_id
+        if not repo_path.exists():
+            raise HTTPException(status_code=404, detail="Repository not found")
+        
+        # Analyze repository using background task
+        analysis = await asyncio.get_event_loop().run_in_executor(
+            None,
+            analyze_repository,
+            str(repo_path)
+        )
+        
+        return AnalysisResponse(**analysis)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Analysis failed for repo {repo_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to analyze repository")
 
-@app.get("/api/status")
-@limiter.limit("30/minute")
-async def get_status(request: Request):
-    """Get system and API status"""
-    return {
-        "api_status": "operational",
-        "endpoints_available": 6,
-        "security_features": [
-            "Rate limiting active",
-            "CORS protection enabled",
-            "Security headers configured",
-            "Health monitoring active"
-        ],
-        "uptime": time.time() - app.state.start_time
-    }
+@app.get("/file")
+@limiter.limit("50/minute")
+async def stream_file(
+    request: Request,
+    repo_id: str = Query(..., description="Repository ID"),
+    path: str = Query(..., description="Relative path to file within repository")
+):
+    """
+    Stream file contents from a cloned repository.
+    
+    Returns file contents as an efficient streaming response to handle large files.
+    """
+    try:
+        # Validate inputs
+        if not validate_repo_id(repo_id):
+            raise HTTPException(status_code=400, detail="Invalid repository ID format")
+        
+        if not validate_file_path(path):
+            raise HTTPException(status_code=400, detail="Invalid file path")
+        
+        repo_path = CODEBASE_DIR / repo_id
+        if not repo_path.exists():
+            raise HTTPException(status_code=404, detail="Repository not found")
+        
+        file_path = repo_path / path
+        
+        # Security check: ensure file is within repository bounds
+        try:
+            file_path.resolve().relative_to(repo_path.resolve())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Path traversal not allowed")
+        
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        if not file_path.is_file():
+            raise HTTPException(status_code=400, detail="Path is not a file")
+        
+        # Stream file contents
+        return StreamingResponse(
+            stream_file_contents(str(file_path)),
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f"attachment; filename={file_path.name}"}
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"File streaming failed for {repo_id}/{path}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to stream file")
 
 # Error handlers
 @app.exception_handler(404)
@@ -228,6 +292,13 @@ async def internal_error_handler(request: Request, exc):
 async def startup_event():
     logger.info("Playground API starting up...")
     logger.info("Security features enabled: Rate limiting, CORS, Security headers")
+    logger.info(f"Codebase directory: {CODEBASE_DIR}")
+    
+    # Verify GitHub token is available (without logging it)
+    if not os.getenv("GITHUB_TOKEN"):
+        logger.warning("GITHUB_TOKEN environment variable not set")
+    else:
+        logger.info("GitHub authentication configured")
     
 # Shutdown event
 @app.on_event("shutdown")

@@ -1,0 +1,27 @@
+{
+  "name": "playground",
+  "version": "1.0.0",
+  "description": "codeshuriken playground for repo cloning, scanning and cleansing",
+  "main": "main.py",
+  "scripts": {
+    "start": "python -m uvicorn main:app --host 0.0.0.0 --port 8000",
+    "dev": "python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload",
+    "test": "python -m pytest",
+    "security-audit": "python -m pip-audit",
+    "docker:build": "docker build -t playground .",
+    "docker:run": "docker-compose up -d",
+    "docker:stop": "docker-compose down",
+    "docker:logs": "docker-compose logs -f",
+    "install": "pip install -r requirements.txt"
+  },
+  "keywords": ["playground", "security", "docker", "fastapi", "python"],
+  "author": "ShielderSoft",
+  "license": "MIT",
+  "engines": {
+    "python": ">=3.11.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ShielderSoft/Playground.git"
+  }
+}

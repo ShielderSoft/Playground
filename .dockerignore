@@ -1,0 +1,75 @@
+# Docker ignore file for Playground
+# Ignore version control
+.git
+.gitignore
+
+# Ignore Python cache and virtual environments
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env
+pip-log.txt
+pip-delete-this-directory.txt
+.tox
+.coverage
+.coverage.*
+.pytest_cache
+venv/
+.venv/
+.env/
+
+# Ignore environment files
+.env
+.env.local
+.env.*.local
+
+# Ignore logs
+logs
+*.log
+
+# Ignore temporary files
+.tmp
+*.tmp
+*.temp
+
+# Ignore IDE files
+.vscode
+.idea
+*.swp
+*.swo
+.pylintrc
+.mypy_cache
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Ignore build artifacts
+dist
+build
+coverage
+.pytest_cache
+htmlcov/
+
+# Ignore documentation that's not needed in container
+docs
+*.md
+LICENSE
+
+# Ignore Docker files (except for multi-stage builds)
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Ignore security and config files
+.secrets
+config/local.json
+.env.*
+
+# Ignore Node.js files (if any remain)
+node_modules
+npm-debug.log*
+package-lock.json

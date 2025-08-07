@@ -15,6 +15,10 @@ from typing import Dict, Any, Optional
 from pydantic import BaseModel, validator
 import asyncio
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from utils import (
     clone_repository_to_filesystem,
@@ -115,7 +119,7 @@ class HealthResponse(BaseModel):
 app.state.start_time = time.time()
 
 # Ensure codebase directory exists
-CODEBASE_DIR = Path("/app/codebase")
+CODEBASE_DIR = Path("./codebase")
 CODEBASE_DIR.mkdir(exist_ok=True)
 
 @app.get("/health", response_model=HealthResponse)

@@ -9,6 +9,7 @@ import uuid
 import shutil
 import subprocess
 import asyncio
+import stat
 from pathlib import Path
 from typing import Dict, Any, AsyncGenerator, Optional
 import logging
@@ -83,6 +84,32 @@ BINARY_EXTENSIONS = {
     '.pyc', '.pyo', '.pyd',
     '.node', '.wasm'
 }
+
+def safe_rmtree(path: Path) -> None:
+    """
+    Safely remove a directory tree, handling Windows permission issues.
+    
+    Args:
+        path: Path to directory to remove
+    """
+    def handle_remove_readonly(func, path, exc):
+        """Handle removal of read-only files on Windows."""
+        if os.path.exists(path):
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+    
+    try:
+        if path.exists():
+            shutil.rmtree(str(path), onerror=handle_remove_readonly)
+    except Exception as e:
+        logger.warning(f"Failed to clean up directory {path}: {str(e)}")
+        # Try alternative cleanup method for Windows
+        try:
+            if os.name == 'nt':  # Windows
+                subprocess.run(['rmdir', '/s', '/q', str(path)], 
+                             shell=True, check=False, capture_output=True)
+        except Exception as e2:
+            logger.error(f"Alternative cleanup also failed: {str(e2)}")
 
 def validate_repo_id(repo_id: str) -> bool:
     """
@@ -168,10 +195,15 @@ def clone_repository_to_filesystem(
         ValueError: For invalid input parameters
         RuntimeError: For git operation failures
     """
+    repo_path = None
     try:
         # Generate unique identifier for this repository
         repo_id = str(uuid.uuid4())
         repo_path = Path(base_path) / repo_id
+        
+        # Ensure base path exists with proper permissions
+        base_path_obj = Path(base_path)
+        base_path_obj.mkdir(exist_ok=True)
         
         # Normalize repository URL
         normalized_url = normalize_repo_url(repo_url)
@@ -187,34 +219,125 @@ def clone_repository_to_filesystem(
         
         logger.info(f"Cloning repository to {repo_path}")
         
-        # Clone repository using GitPython
-        repo = Repo.clone_from(
-            auth_url,
-            str(repo_path),
-            branch=branch,
-            depth=1,  # Shallow clone for efficiency
-            single_branch=True
-        )
+        # First, try to get the default branch if the specified branch fails
+        def try_clone_with_branch(target_branch):
+            """Helper function to try cloning with a specific branch."""
+            try:
+                cmd = [
+                    'git', 'clone', 
+                    '--depth', '1', 
+                    '--single-branch', 
+                    '--branch', target_branch,
+                    auth_url, 
+                    str(repo_path)
+                ]
+                
+                result = subprocess.run(
+                    cmd, 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=300,  # 5 minute timeout
+                    check=True
+                )
+                
+                logger.info(f"Clone completed using subprocess method with branch '{target_branch}'")
+                return True
+                
+            except subprocess.CalledProcessError as e:
+                if "not found in upstream origin" in e.stderr:
+                    logger.warning(f"Branch '{target_branch}' not found in repository")
+                    return False
+                else:
+                    # Re-raise for other git errors
+                    raise e
+        
+        # Try the requested branch first
+        clone_successful = False
+        final_branch = branch
+        
+        try:
+            clone_successful = try_clone_with_branch(branch)
+        except subprocess.CalledProcessError:
+            # If subprocess fails entirely, we'll try GitPython later
+            pass
+        
+        # If the requested branch doesn't exist, try common default branches
+        if not clone_successful:
+            logger.info(f"Branch '{branch}' not found, trying default branches...")
+            default_branches = ['master', 'main', 'develop', 'dev']
+            
+            # Remove the originally requested branch from defaults to avoid duplicate attempts
+            if branch in default_branches:
+                default_branches.remove(branch)
+            
+            for default_branch in default_branches:
+                try:
+                    if try_clone_with_branch(default_branch):
+                        clone_successful = True
+                        final_branch = default_branch
+                        logger.info(f"Successfully cloned using default branch '{default_branch}'")
+                        break
+                except subprocess.CalledProcessError:
+                    continue
+        
+        # If subprocess method failed entirely, try GitPython as fallback
+        if not clone_successful:
+            logger.warning("Subprocess git clone failed, trying GitPython...")
+            try:
+                repo = Repo.clone_from(
+                    auth_url,
+                    str(repo_path),
+                    branch=branch,
+                    depth=1,
+                    single_branch=True
+                )
+                logger.info("Clone completed using GitPython method")
+                clone_successful = True
+            except git.exc.GitCommandError as git_error:
+                # Try with default branches using GitPython
+                if "not found in upstream origin" in str(git_error):
+                    logger.info("Trying default branches with GitPython...")
+                    default_branches = ['master', 'main', 'develop', 'dev']
+                    if branch in default_branches:
+                        default_branches.remove(branch)
+                    
+                    for default_branch in default_branches:
+                        try:
+                            if repo_path.exists():
+                                safe_rmtree(repo_path)
+                            repo = Repo.clone_from(
+                                auth_url,
+                                str(repo_path),
+                                branch=default_branch,
+                                depth=1,
+                                single_branch=True
+                            )
+                            final_branch = default_branch
+                            logger.info(f"Successfully cloned using GitPython with branch '{default_branch}'")
+                            clone_successful = True
+                            break
+                        except git.exc.GitCommandError:
+                            continue
+                
+                if not clone_successful:
+                    raise git_error
+        
+        if not clone_successful:
+            raise RuntimeError(f"Failed to clone repository: No valid branches found")
         
         # Remove git directory to save space and prevent accidental operations
         git_dir = repo_path / '.git'
         if git_dir.exists():
-            shutil.rmtree(git_dir)
+            safe_rmtree(git_dir)
         
-        logger.info(f"Successfully cloned repository {repo_url} to {repo_id}")
+        logger.info(f"Successfully cloned repository {repo_url} (branch: {final_branch}) to {repo_id}")
         return repo_id
         
-    except git.exc.GitCommandError as e:
-        logger.error(f"Git clone failed: {str(e)}")
-        # Clean up partial clone
-        if repo_path.exists():
-            shutil.rmtree(repo_path)
-        raise RuntimeError(f"Failed to clone repository: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error during clone: {str(e)}")
         # Clean up partial clone
-        if 'repo_path' in locals() and repo_path.exists():
-            shutil.rmtree(repo_path)
+        if repo_path and repo_path.exists():
+            safe_rmtree(repo_path)
         raise RuntimeError(f"Clone operation failed: {str(e)}")
 
 def count_lines_in_file(file_path: Path) -> int:
@@ -432,7 +555,7 @@ def cleanup_repository(repo_id: str, base_path: str) -> bool:
         repo_path = Path(base_path) / repo_id
         
         if repo_path.exists():
-            shutil.rmtree(repo_path)
+            safe_rmtree(repo_path)
             logger.info(f"Successfully cleaned up repository {repo_id}")
             return True
         else:
